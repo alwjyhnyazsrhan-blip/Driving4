@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="locatBg" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#065f46" />
+      <stop offset="100%" stop-color="#022c22" />
+    </linearGradient>
+    <linearGradient id="radarArc" x1="120" y1="120" x2="392" y2="392" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6ee7b7" />
+      <stop offset="100%" stop-color="#10b981" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#locatBg)" />
+  <circle cx="256" cy="242" r="158" stroke="url(#radarArc)" stroke-opacity="0.8" stroke-width="10" stroke-dasharray="260 60 120 70" stroke-linecap="round" />
+  <circle cx="256" cy="242" r="120" stroke="#34d399" stroke-opacity="0.45" stroke-width="6" stroke-dasharray="180 50" stroke-linecap="round" />
+  <path d="M256 122C195.2 122 146 171.2 146 232C146 304.5 232.6 382.2 248.4 395.8C252.8 399.6 259.2 399.6 263.6 395.8C279.4 382.2 366 304.5 366 232C366 171.2 316.8 122 256 122Z" fill="#ffffff" />
+  <circle cx="256" cy="226" r="46" fill="#064e3b" />
+  <circle cx="256" cy="226" r="24" stroke="#34d399" stroke-width="6" fill="none" />
+  <circle cx="256" cy="226" r="9" fill="#fbbf24" />
+  <line x1="262" y1="220" x2="358" y2="124" stroke="#6ee7b7" stroke-width="8" stroke-linecap="round" />
+  <circle cx="358" cy="124" r="9" fill="#6ee7b7" />
+  <path d="M114 352L294 294L280 264L388 298L306 376L298 342L114 352Z" fill="#ffffff" stroke="#022c22" stroke-width="10" stroke-linejoin="round" />
+  <path d="M312 284L374 300L322 350L334 312L312 284Z" fill="#fbbf24" />
+</svg>
