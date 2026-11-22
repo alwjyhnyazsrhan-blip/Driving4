@@ -28,6 +28,7 @@ import {
 } from './src/types';
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
@@ -135,6 +136,7 @@ let alerts: AlertLog[] = [];
 let customCourierPhones: Record<string, { phone: string; name?: string; updatedAt: string }> = {};
 let courierPortalAuth: Record<string, { passwordHash: string; updatedAt: string }> = {};
 let adminPortalAuth: { passwordHash: string; updatedAt: string } | null = null;
+let adminPersistedSessions: Record<string, { createdAt: number; expiresAt: number }> = {};
 let whatsappSessionBackup: Record<string, string> = {};
 
 // --- COURIER PORTAL SECURITY HELPERS (SCRYPT HASHING + SERVER-SIDE SESSIONS) ---
@@ -191,8 +193,99 @@ interface AdminPortalSession {
   expiresAt: number;
 }
 
-const adminPortalSessions = new Map<string, AdminPortalSession>();
+const ADMIN_COOKIE_NAME = 'locat_admin_session';
+const ADMIN_SESSION_TTL_MS = 365 * 24 * 60 * 60 * 1000; // 1 year persistent session until explicit logout
 const adminLoginAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function hashSessionToken(token: string): string {
+  return crypto.createHash('sha256').update(token, 'utf8').digest('hex');
+}
+
+function parseCookieValue(req: Request, name: string): string | null {
+  const cookieHeader = req.headers.cookie;
+  if (!cookieHeader || typeof cookieHeader !== 'string') return null;
+  const parts = cookieHeader.split(';');
+  for (const part of parts) {
+    const idx = part.indexOf('=');
+    if (idx === -1) continue;
+    const key = part.slice(0, idx).trim();
+    if (key === name) {
+      const val = part.slice(idx + 1).trim();
+      try {
+        return decodeURIComponent(val) || null;
+      } catch {
+        return val || null;
+      }
+    }
+  }
+  return null;
+}
+
+function isHttpsRequest(req: Request): boolean {
+  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  return Boolean(req.secure || proto === 'https');
+}
+
+function setAdminSessionCookie(req: Request, res: Response, token: string) {
+  const maxAgeSec = Math.floor(ADMIN_SESSION_TTL_MS / 1000);
+  if (isHttpsRequest(req)) {
+    res.setHeader(
+      'Set-Cookie',
+      `${ADMIN_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; Max-Age=${maxAgeSec}; HttpOnly; Secure; SameSite=None; Partitioned`
+    );
+  } else {
+    res.setHeader(
+      'Set-Cookie',
+      `${ADMIN_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; Max-Age=${maxAgeSec}; HttpOnly; SameSite=Lax`
+    );
+  }
+}
+
+function clearAdminSessionCookie(req: Request, res: Response) {
+  if (isHttpsRequest(req)) {
+    res.setHeader(
+      'Set-Cookie',
+      `${ADMIN_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None; Partitioned`
+    );
+  } else {
+    res.setHeader(
+      'Set-Cookie',
+      `${ADMIN_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`
+    );
+  }
+}
+
+function verifyCookieCsrf(req: Request): boolean {
+  const xRequestedWith = String(req.headers['x-requested-with'] || '').trim();
+  if (xRequestedWith === 'LocatAdminApp') return true;
+  const origin = req.headers.origin;
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+  if (origin && host) {
+    try {
+      const originHost = new URL(origin).host;
+      if (originHost === host) return true;
+    } catch {}
+  }
+  return false;
+}
+
+function createPersistedAdminSession(): string {
+  const now = Date.now();
+  // Prune expired sessions
+  for (const [hash, sess] of Object.entries(adminPersistedSessions)) {
+    if (!sess || sess.expiresAt < now) {
+      delete adminPersistedSessions[hash];
+    }
+  }
+  const token = crypto.randomBytes(32).toString('hex');
+  const tokenHash = hashSessionToken(token);
+  adminPersistedSessions[tokenHash] = {
+    createdAt: now,
+    expiresAt: now + ADMIN_SESSION_TTL_MS,
+  };
+  saveStoreToDisk();
+  return token;
+}
 
 function safeEqualText(a: string, b: string): boolean {
   const digestA = crypto.createHash('sha256').update(a, 'utf8').digest();
@@ -215,15 +308,29 @@ function getAdminAuthMode(): 'admin_password' | 'locate_credentials' | 'setup' {
   return 'setup';
 }
 
-function getValidAdminSession(req: Request): { token: string; session: AdminPortalSession } | null {
-  const token = getBearerToken(req);
+function getValidAdminSession(
+  req: Request
+): { token: string; tokenHash: string; authMethod: 'bearer' | 'cookie'; session: AdminPortalSession } | null {
+  const bearer = getBearerToken(req);
+  const cookieToken = parseCookieValue(req, ADMIN_COOKIE_NAME);
+  const token = bearer || cookieToken;
   if (!token) return null;
-  const session = adminPortalSessions.get(token);
+
+  const tokenHash = hashSessionToken(token);
+  const session = adminPersistedSessions[tokenHash];
   if (!session || session.expiresAt < Date.now()) {
-    if (session) adminPortalSessions.delete(token);
+    if (session) {
+      delete adminPersistedSessions[tokenHash];
+      saveStoreToDisk();
+    }
     return null;
   }
-  return { token, session };
+  return {
+    token,
+    tokenHash,
+    authMethod: bearer ? 'bearer' : 'cookie',
+    session,
+  };
 }
 
 function requireAdminAuth(req: Request, res: Response, next: express.NextFunction) {
@@ -233,6 +340,14 @@ function requireAdminAuth(req: Request, res: Response, next: express.NextFunctio
       success: false,
       code: 'ADMIN_AUTH_REQUIRED',
       message: 'يرجى تسجيل الدخول للوحة الإدارة أولاً',
+    });
+    return;
+  }
+  const isMutation = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method.toUpperCase());
+  if (valid.authMethod === 'cookie' && isMutation && !verifyCookieCsrf(req)) {
+    res.status(403).json({
+      success: false,
+      message: 'طلب غير مصرح به (تحقق CSRF)',
     });
     return;
   }
@@ -333,6 +448,16 @@ function loadStoreFromDisk() {
       if (data.adminPortalAuth && typeof data.adminPortalAuth === 'object' && typeof data.adminPortalAuth.passwordHash === 'string') {
         adminPortalAuth = data.adminPortalAuth;
       }
+      if (data.adminPersistedSessions && typeof data.adminPersistedSessions === 'object') {
+        const now = Date.now();
+        const loaded: Record<string, { createdAt: number; expiresAt: number }> = {};
+        for (const [hash, sess] of Object.entries(data.adminPersistedSessions)) {
+          if (sess && typeof (sess as any).expiresAt === 'number' && (sess as any).expiresAt > now) {
+            loaded[hash] = sess as { createdAt: number; expiresAt: number };
+          }
+        }
+        adminPersistedSessions = loaded;
+      }
       if (data.whatsappSessionBackup && typeof data.whatsappSessionBackup === 'object') {
         whatsappSessionBackup = data.whatsappSessionBackup;
       }
@@ -357,7 +482,7 @@ function loadStoreFromDisk() {
 
 function saveStoreToDisk() {
   try {
-    const data = { couriers, orders, alerts, settings, customCourierPhones, courierPortalAuth, adminPortalAuth, whatsappSessionBackup };
+    const data = { couriers, orders, alerts, settings, customCourierPhones, courierPortalAuth, adminPortalAuth, adminPersistedSessions, whatsappSessionBackup };
     fs.writeFileSync(STORE_FILE, JSON.stringify(data, null, 2), 'utf-8');
   } catch (err) {
     console.error('[Store] فشل حفظ البيانات في القرص:', err);
@@ -1581,11 +1706,9 @@ app.post('/api/admin-auth/setup', (req: Request, res: Response) => {
     passwordHash: hashCourierPassword(password.trim()),
     updatedAt: new Date().toISOString(),
   };
-  saveStoreToDisk();
 
-  const token = crypto.randomBytes(32).toString('hex');
-  const expiresAt = Date.now() + 12 * 60 * 60 * 1000;
-  adminPortalSessions.set(token, { createdAt: Date.now(), expiresAt });
+  const token = createPersistedAdminSession();
+  setAdminSessionCookie(req, res, token);
 
   res.json({ success: true, token, mode: 'admin_password' });
 });
@@ -1650,18 +1773,23 @@ app.post('/api/admin-auth/login', (req: Request, res: Response) => {
 
   adminLoginAttempts.delete(attemptKey);
 
-  const token = crypto.randomBytes(32).toString('hex');
-  const expiresAt = Date.now() + 12 * 60 * 60 * 1000;
-  adminPortalSessions.set(token, { createdAt: Date.now(), expiresAt });
+  const token = createPersistedAdminSession();
+  setAdminSessionCookie(req, res, token);
 
   res.json({ success: true, token, mode });
 });
 
 app.post('/api/admin-auth/logout', (req: Request, res: Response) => {
-  const token = getBearerToken(req);
-  if (token) {
-    adminPortalSessions.delete(token);
+  const valid = getValidAdminSession(req);
+  if (valid) {
+    if (valid.authMethod === 'cookie' && !verifyCookieCsrf(req)) {
+      res.status(403).json({ success: false, message: 'طلب غير مصرح به' });
+      return;
+    }
+    delete adminPersistedSessions[valid.tokenHash];
+    saveStoreToDisk();
   }
+  clearAdminSessionCookie(req, res);
   res.json({ success: true });
 });
 
@@ -1679,14 +1807,14 @@ app.post('/api/admin-auth/change-password', requireAdminAuth, (req: Request, res
     passwordHash: hashCourierPassword(newPassword.trim()),
     updatedAt: new Date().toISOString(),
   };
-  saveStoreToDisk();
 
-  const currentToken = (req as any).adminSession?.token;
-  for (const token of adminPortalSessions.keys()) {
-    if (token !== currentToken) {
-      adminPortalSessions.delete(token);
+  const currentTokenHash = (req as any).adminSession?.tokenHash;
+  for (const hash of Object.keys(adminPersistedSessions)) {
+    if (hash !== currentTokenHash) {
+      delete adminPersistedSessions[hash];
     }
   }
+  saveStoreToDisk();
 
   res.json({
     success: true,

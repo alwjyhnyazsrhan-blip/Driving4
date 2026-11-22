@@ -17,9 +17,20 @@ let currentConfig: EngineRuntimeConfig = loadEngineConfig();
 let bridgeInstalled = false;
 let nativeFetchRef: typeof window.fetch | null = null;
 let adminAuthToken: string | null = null;
+let adminSessionActive = false;
 
 export function setAdminAuthToken(token: string | null) {
   adminAuthToken = token && token.trim() ? token.trim() : null;
+  if (adminAuthToken) {
+    adminSessionActive = true;
+  }
+}
+
+export function setAdminSessionActive(active: boolean) {
+  adminSessionActive = active;
+  if (!active) {
+    adminAuthToken = null;
+  }
 }
 
 export function getAdminAuthToken(): string | null {
@@ -179,7 +190,7 @@ export function installApiBridge() {
       } catch {}
     }
 
-    // Attach in-memory Admin Bearer token on protected admin API calls
+    // Attach in-memory Admin Bearer token + CSRF header on protected admin API calls
     const isCourierApi = pathname.startsWith('/api/courier-portal');
     const isPublicAuthApi =
       pathname === '/api/health' ||
@@ -187,18 +198,26 @@ export function installApiBridge() {
       pathname === '/api/admin-auth/login' ||
       pathname === '/api/admin-auth/setup';
 
+    const isAdminAuthed = Boolean(adminAuthToken || adminSessionActive);
     let finalInit: RequestInit | undefined = init;
-    if (!isCourierApi && !isPublicAuthApi && adminAuthToken) {
+    if (!isCourierApi) {
       const headers = new Headers(init?.headers || (input instanceof Request ? input.headers : undefined));
-      if (!headers.has('Authorization')) {
-        headers.set('Authorization', `Bearer ${adminAuthToken}`);
+      if (!isPublicAuthApi) {
+        headers.set('X-Requested-With', 'LocatAdminApp');
+        if (adminAuthToken && !headers.has('Authorization')) {
+          headers.set('Authorization', `Bearer ${adminAuthToken}`);
+        }
       }
-      finalInit = { ...init, headers };
+      finalInit = {
+        ...init,
+        headers,
+        credentials: init?.credentials || (currentConfig.mode === 'local_server' ? 'include' : 'same-origin'),
+      };
     }
 
     // Mode 1: Pure Standalone Browser Mode (Zero hosting / zero backend server calls)
     if (currentConfig.mode === 'standalone') {
-      if (!isCourierApi && !isPublicAuthApi && !adminAuthToken) {
+      if (!isCourierApi && !isPublicAuthApi && !isAdminAuthed) {
         return new Response(JSON.stringify({ success: false, code: 'ADMIN_AUTH_REQUIRED', message: 'يرجى تسجيل الدخول للإدارة أولاً' }), {
           status: 401,
           headers: { 'Content-Type': 'application/json' },
@@ -255,6 +274,7 @@ export function installApiBridge() {
 
       if (response.status === 401 && !isCourierApi && !isPublicAuthApi) {
         adminAuthToken = null;
+        adminSessionActive = false;
         notifyAdminUnauthorized();
         return response;
       }
@@ -266,7 +286,7 @@ export function installApiBridge() {
       }
 
       // Mirror GET responses into local IndexedDB silently only when authenticated
-      if (method === 'GET' && response.ok && contentType.includes('application/json') && (adminAuthToken || isCourierApi)) {
+      if (method === 'GET' && response.ok && contentType.includes('application/json') && (isAdminAuthed || isCourierApi)) {
         response
           .clone()
           .json()
@@ -278,7 +298,7 @@ export function installApiBridge() {
     } catch (err: any) {
       clearTimeout(timeoutId);
       // Never leak admin localEngine fallback to unauthenticated visitors
-      if (!isCourierApi && !isPublicAuthApi && !adminAuthToken) {
+      if (!isCourierApi && !isPublicAuthApi && !isAdminAuthed) {
         return new Response(JSON.stringify({ success: false, code: 'ADMIN_AUTH_REQUIRED', message: 'تعذر التحقق من جلسة الإدارة' }), {
           status: 401,
           headers: { 'Content-Type': 'application/json' },

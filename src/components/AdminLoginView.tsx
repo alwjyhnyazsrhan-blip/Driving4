@@ -126,7 +126,7 @@ export const AdminLoginView: React.FC<AdminLoginViewProps> = ({ onAuthenticated 
           <div>
             <h1 className="text-lg font-bold leading-snug">دخول لوحة الإدارة</h1>
             <p className="text-xs text-slate-300 mt-0.5">
-              لوحة التحكم محمية ولا يمكن الوصول إليها إلا من قِبل الإدارة
+              يتم تسجيل الدخول لمرة واحدة فقط ويُحفظ تلقائياً على هذا الجهاز
             </p>
           </div>
         </div>

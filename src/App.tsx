@@ -18,10 +18,11 @@ import {
   getEngineConfig,
   subscribeEngineConfig,
   setAdminAuthToken,
+  setAdminSessionActive,
   subscribeAdminUnauthorized,
 } from './services/apiBridge';
 import { Order, Courier, SystemSettings, AlertLog, WhatsAppConnectionState, CloudSyncState } from './types';
-import { Bell, CheckCircle2, AlertTriangle, X } from 'lucide-react';
+import { Bell, CheckCircle2, AlertTriangle, X, Loader2 } from 'lucide-react';
 
 function getInitialPortalParams(): { isPortal: boolean; phone: string } {
   if (typeof window === 'undefined') return { isPortal: false, phone: '' };
@@ -41,6 +42,8 @@ export default function App() {
   const [portalInitialPhone, setPortalInitialPhone] = useState<string>(initialPortal.phone);
   const [openedPortalFromAdmin, setOpenedPortalFromAdmin] = useState<boolean>(false);
   const [adminToken, setAdminToken] = useState<string | null>(null);
+  const [isAdminAuthenticated, setIsAdminAuthenticated] = useState<boolean>(false);
+  const [isCheckingAdminAuth, setIsCheckingAdminAuth] = useState<boolean>(!initialPortal.isPortal);
   const [currentTab, setCurrentTab] = useState<'orders' | 'couriers' | 'alerts' | 'report' | 'automation'>('orders');
   
   // Data states (clean initial state, filled only with real data from backend/Locat)
@@ -171,20 +174,58 @@ export default function App() {
 
   useEffect(() => {
     setAdminAuthToken(adminToken);
+    if (adminToken) {
+      setAdminSessionActive(true);
+    }
   }, [adminToken]);
 
   useEffect(() => {
     return subscribeAdminUnauthorized(() => {
       setAdminAuthToken(null);
+      setAdminSessionActive(false);
       setAdminToken(null);
+      setIsAdminAuthenticated(false);
     });
   }, []);
+
+  // On startup, check if persistent HttpOnly admin session cookie is already valid
+  useEffect(() => {
+    if (isCourierPortalMode) {
+      setIsCheckingAdminAuth(false);
+      return;
+    }
+    let active = true;
+    fetch('/api/admin-auth/status', { credentials: 'same-origin' })
+      .then((r) => r.json())
+      .then((data) => {
+        if (!active) return;
+        if (data?.success && data?.authenticated) {
+          setAdminSessionActive(true);
+          setIsAdminAuthenticated(true);
+        } else {
+          setAdminSessionActive(false);
+          setIsAdminAuthenticated(false);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setAdminSessionActive(false);
+          setIsAdminAuthenticated(false);
+        }
+      })
+      .finally(() => {
+        if (active) setIsCheckingAdminAuth(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [isCourierPortalMode]);
 
   // Only attach Admin PWA manifest when an Admin is explicitly authenticated (never for couriers or unauthenticated visitors)
   useEffect(() => {
     if (typeof document === 'undefined') return;
     const existingAdminLink = document.querySelector('link[data-locat-manifest="admin"]');
-    if (!isCourierPortalMode && adminToken) {
+    if (!isCourierPortalMode && isAdminAuthenticated) {
       if (!existingAdminLink) {
         const link = document.createElement('link');
         link.rel = 'manifest';
@@ -195,11 +236,13 @@ export default function App() {
     } else if (existingAdminLink) {
       existingAdminLink.remove();
     }
-  }, [isCourierPortalMode, adminToken]);
+  }, [isCourierPortalMode, isAdminAuthenticated]);
 
   const handleAdminAuthenticated = useCallback((token: string) => {
     setAdminAuthToken(token);
+    setAdminSessionActive(true);
     setAdminToken(token);
+    setIsAdminAuthenticated(true);
   }, []);
 
   const handleLogoutAdmin = useCallback(async () => {
@@ -207,14 +250,16 @@ export default function App() {
       await fetch('/api/admin-auth/logout', { method: 'POST' });
     } catch {}
     setAdminAuthToken(null);
+    setAdminSessionActive(false);
     setAdminToken(null);
+    setIsAdminAuthenticated(false);
     setOrders([]);
     setCouriers([]);
     setAlerts([]);
   }, []);
 
   useEffect(() => {
-    if (isCourierPortalMode || !adminToken) return;
+    if (isCourierPortalMode || !isAdminAuthenticated) return;
 
     // Restore any custom courier phones previously configured from browser local storage
     try {
@@ -254,10 +299,10 @@ export default function App() {
       fetchData(true);
     }, 20000);
     return () => clearInterval(interval);
-  }, [fetchData, isCourierPortalMode, adminToken]);
+  }, [fetchData, isCourierPortalMode, isAdminAuthenticated]);
 
   useEffect(() => {
-    if (isCourierPortalMode || !adminToken) return;
+    if (isCourierPortalMode || !isAdminAuthenticated) return;
     let prevBackend = getEngineConfig().activeBackend;
     const unsubscribe = subscribeEngineConfig((cfg) => {
       if (cfg.activeBackend !== prevBackend) {
@@ -268,16 +313,16 @@ export default function App() {
     return () => {
       unsubscribe();
     };
-  }, [fetchData, isCourierPortalMode, adminToken]);
+  }, [fetchData, isCourierPortalMode, isAdminAuthenticated]);
 
   // Quick follow-up poll until WhatsApp QR code is generated on startup
   useEffect(() => {
-    if (isCourierPortalMode || !adminToken || whatsappState?.isLoggedIn || whatsappState?.qrDataUrl) return;
+    if (isCourierPortalMode || !isAdminAuthenticated || whatsappState?.isLoggedIn || whatsappState?.qrDataUrl) return;
     const qrTimer = setInterval(() => {
       fetchData(true);
     }, 3500);
     return () => clearInterval(qrTimer);
-  }, [whatsappState?.isLoggedIn, whatsappState?.qrDataUrl, fetchData, isCourierPortalMode, adminToken]);
+  }, [whatsappState?.isLoggedIn, whatsappState?.qrDataUrl, fetchData, isCourierPortalMode, isAdminAuthenticated]);
 
   // Advance time simulation (+5 / +15 mins)
   const handleAdvanceTime = async (minutes: number) => {
@@ -543,7 +588,7 @@ export default function App() {
       <CourierPortalView
         initialPhone={portalInitialPhone}
         onExitPortal={
-          openedPortalFromAdmin && adminToken
+          openedPortalFromAdmin && isAdminAuthenticated
             ? () => {
                 setIsCourierPortalMode(false);
                 setOpenedPortalFromAdmin(false);
@@ -554,7 +599,16 @@ export default function App() {
     );
   }
 
-  if (!adminToken) {
+  if (isCheckingAdminAuth) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center gap-3 text-slate-600 text-xs font-bold" dir="rtl">
+        <Loader2 className="w-7 h-7 animate-spin text-emerald-600" />
+        <span>جاري فتح لوحة الإدارة...</span>
+      </div>
+    );
+  }
+
+  if (!isAdminAuthenticated) {
     return <AdminLoginView onAuthenticated={handleAdminAuthenticated} />;
   }
 
