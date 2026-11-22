@@ -32,17 +32,19 @@ const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
 app.use('/api', (req, res, next) => {
-  // Never emit wildcard CORS on authenticated courier portal routes
-  if (req.path.startsWith('/courier-portal')) {
-    next();
-    return;
-  }
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-api-key');
-  if (req.method === 'OPTIONS') {
-    res.sendStatus(204);
-    return;
+  // Never emit wildcard CORS on authenticated endpoints; allow Locate origin only on /api/locat/sync
+  if (req.path === '/locat/sync') {
+    const origin = req.headers.origin;
+    if (origin && (origin === 'https://supplier.locate.sa' || origin === 'http://supplier.locate.sa')) {
+      res.header('Access-Control-Allow-Origin', origin);
+      res.header('Vary', 'Origin');
+    }
+    res.header('Access-Control-Allow-Methods', 'POST,OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-api-key');
+    if (req.method === 'OPTIONS') {
+      res.sendStatus(204);
+      return;
+    }
   }
   next();
 });
@@ -132,6 +134,7 @@ let orders: Order[] = [];
 let alerts: AlertLog[] = [];
 let customCourierPhones: Record<string, { phone: string; name?: string; updatedAt: string }> = {};
 let courierPortalAuth: Record<string, { passwordHash: string; updatedAt: string }> = {};
+let adminPortalAuth: { passwordHash: string; updatedAt: string } | null = null;
 let whatsappSessionBackup: Record<string, string> = {};
 
 // --- COURIER PORTAL SECURITY HELPERS (SCRYPT HASHING + SERVER-SIDE SESSIONS) ---
@@ -180,6 +183,61 @@ function getBearerToken(req: Request): string | null {
   if (!authHeader.startsWith('Bearer ')) return null;
   const token = authHeader.slice(7).trim();
   return token || null;
+}
+
+// --- ADMIN DASHBOARD SECURITY HELPERS ---
+interface AdminPortalSession {
+  createdAt: number;
+  expiresAt: number;
+}
+
+const adminPortalSessions = new Map<string, AdminPortalSession>();
+const adminLoginAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function safeEqualText(a: string, b: string): boolean {
+  const digestA = crypto.createHash('sha256').update(a, 'utf8').digest();
+  const digestB = crypto.createHash('sha256').update(b, 'utf8').digest();
+  return crypto.timingSafeEqual(digestA, digestB);
+}
+
+function getAdminAuthMode(): 'admin_password' | 'locate_credentials' | 'setup' {
+  if (process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.trim().length > 0) {
+    return 'admin_password';
+  }
+  if (adminPortalAuth?.passwordHash) {
+    return 'admin_password';
+  }
+  const hasLocateEmail = Boolean((settings.locateEmail || settings.locateUsername || '').trim());
+  const hasLocatePass = Boolean((settings.locatePassword || '').trim());
+  if (hasLocateEmail && hasLocatePass) {
+    return 'locate_credentials';
+  }
+  return 'setup';
+}
+
+function getValidAdminSession(req: Request): { token: string; session: AdminPortalSession } | null {
+  const token = getBearerToken(req);
+  if (!token) return null;
+  const session = adminPortalSessions.get(token);
+  if (!session || session.expiresAt < Date.now()) {
+    if (session) adminPortalSessions.delete(token);
+    return null;
+  }
+  return { token, session };
+}
+
+function requireAdminAuth(req: Request, res: Response, next: express.NextFunction) {
+  const valid = getValidAdminSession(req);
+  if (!valid) {
+    res.status(401).json({
+      success: false,
+      code: 'ADMIN_AUTH_REQUIRED',
+      message: 'يرجى تسجيل الدخول للوحة الإدارة أولاً',
+    });
+    return;
+  }
+  (req as any).adminSession = valid;
+  next();
 }
 
 function backupBaileysSession() {
@@ -272,6 +330,9 @@ function loadStoreFromDisk() {
       if (data.courierPortalAuth && typeof data.courierPortalAuth === 'object') {
         courierPortalAuth = data.courierPortalAuth;
       }
+      if (data.adminPortalAuth && typeof data.adminPortalAuth === 'object' && typeof data.adminPortalAuth.passwordHash === 'string') {
+        adminPortalAuth = data.adminPortalAuth;
+      }
       if (data.whatsappSessionBackup && typeof data.whatsappSessionBackup === 'object') {
         whatsappSessionBackup = data.whatsappSessionBackup;
       }
@@ -296,7 +357,7 @@ function loadStoreFromDisk() {
 
 function saveStoreToDisk() {
   try {
-    const data = { couriers, orders, alerts, settings, customCourierPhones, courierPortalAuth, whatsappSessionBackup };
+    const data = { couriers, orders, alerts, settings, customCourierPhones, courierPortalAuth, adminPortalAuth, whatsappSessionBackup };
     fs.writeFileSync(STORE_FILE, JSON.stringify(data, null, 2), 'utf-8');
   } catch (err) {
     console.error('[Store] فشل حفظ البيانات في القرص:', err);
@@ -1468,6 +1529,171 @@ function generateDailyReport(): DailyReportSummary {
 
 // --- API ROUTES ---
 
+// --- GLOBAL ADMIN AUTH GUARD FOR /api ---
+const PUBLIC_OR_CUSTOM_AUTH_API_PATHS = new Set([
+  '/health',
+  '/admin-auth/status',
+  '/admin-auth/login',
+  '/admin-auth/setup',
+  '/admin-auth/logout',
+  '/courier-portal/login',
+  '/courier-portal/logout',
+  '/courier-portal/me',
+  '/locat/sync',
+]);
+
+app.use('/api', (req: Request, res: Response, next: express.NextFunction) => {
+  if (PUBLIC_OR_CUSTOM_AUTH_API_PATHS.has(req.path)) {
+    next();
+    return;
+  }
+  requireAdminAuth(req, res, next);
+});
+
+// 0. Admin Portal Authentication Routes
+app.get('/api/admin-auth/status', (req: Request, res: Response) => {
+  const valid = getValidAdminSession(req);
+  res.json({
+    success: true,
+    authenticated: Boolean(valid),
+    mode: getAdminAuthMode(),
+  });
+});
+
+app.post('/api/admin-auth/setup', (req: Request, res: Response) => {
+  if (getAdminAuthMode() !== 'setup') {
+    res.status(403).json({
+      success: false,
+      message: 'تم إعداد كلمة مرور الإدارة مسبقاً، يرجى تسجيل الدخول',
+    });
+    return;
+  }
+  const { password } = req.body || {};
+  if (typeof password !== 'string' || password.trim().length < 6) {
+    res.status(400).json({
+      success: false,
+      message: 'كلمة المرور يجب أن تكون 6 أحرف/أرقام على الأقل',
+    });
+    return;
+  }
+
+  adminPortalAuth = {
+    passwordHash: hashCourierPassword(password.trim()),
+    updatedAt: new Date().toISOString(),
+  };
+  saveStoreToDisk();
+
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = Date.now() + 12 * 60 * 60 * 1000;
+  adminPortalSessions.set(token, { createdAt: Date.now(), expiresAt });
+
+  res.json({ success: true, token, mode: 'admin_password' });
+});
+
+app.post('/api/admin-auth/login', (req: Request, res: Response) => {
+  const { email, password } = req.body || {};
+  if (typeof password !== 'string' || !password.trim()) {
+    res.status(400).json({ success: false, message: 'يرجى إدخال كلمة المرور' });
+    return;
+  }
+
+  const attemptKey = req.ip || 'ip';
+  const now = Date.now();
+  const attempt = adminLoginAttempts.get(attemptKey);
+  if (attempt && attempt.resetAt > now && attempt.count >= 10) {
+    res.status(429).json({
+      success: false,
+      message: 'تم تجاوز عدد محاولات الدخول المسموحة، يرجى المحاولة بعد عدة دقائق',
+    });
+    return;
+  }
+
+  const mode = getAdminAuthMode();
+  if (mode === 'setup') {
+    res.status(400).json({
+      success: false,
+      message: 'لم يتم تعيين كلمة مرور الإدارة بعد، يرجى إتمام الإعداد الأولي',
+    });
+    return;
+  }
+
+  let isAuthorized = false;
+  const trimmedPassword = password.trim();
+
+  if (process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.trim().length > 0) {
+    isAuthorized = safeEqualText(trimmedPassword, process.env.ADMIN_PASSWORD.trim());
+  } else if (adminPortalAuth?.passwordHash) {
+    isAuthorized = verifyCourierPassword(trimmedPassword, adminPortalAuth.passwordHash);
+  } else if (mode === 'locate_credentials') {
+    const expectedEmail = (settings.locateEmail || settings.locateUsername || '').trim().toLowerCase();
+    const expectedPassword = (settings.locatePassword || '').trim();
+    const providedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    isAuthorized =
+      Boolean(expectedEmail && expectedPassword && providedEmail) &&
+      safeEqualText(providedEmail, expectedEmail) &&
+      safeEqualText(trimmedPassword, expectedPassword);
+  }
+
+  if (!isAuthorized) {
+    adminLoginAttempts.set(attemptKey, {
+      count: (attempt && attempt.resetAt > now ? attempt.count : 0) + 1,
+      resetAt: attempt && attempt.resetAt > now ? attempt.resetAt : now + 5 * 60 * 1000,
+    });
+    res.status(401).json({
+      success: false,
+      message: mode === 'locate_credentials'
+        ? 'البريد الإلكتروني أو كلمة المرور غير صحيحة'
+        : 'كلمة مرور الإدارة غير صحيحة',
+    });
+    return;
+  }
+
+  adminLoginAttempts.delete(attemptKey);
+
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = Date.now() + 12 * 60 * 60 * 1000;
+  adminPortalSessions.set(token, { createdAt: Date.now(), expiresAt });
+
+  res.json({ success: true, token, mode });
+});
+
+app.post('/api/admin-auth/logout', (req: Request, res: Response) => {
+  const token = getBearerToken(req);
+  if (token) {
+    adminPortalSessions.delete(token);
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/admin-auth/change-password', requireAdminAuth, (req: Request, res: Response) => {
+  const { newPassword } = req.body || {};
+  if (typeof newPassword !== 'string' || newPassword.trim().length < 6) {
+    res.status(400).json({
+      success: false,
+      message: 'كلمة المرور يجب أن تكون 6 أحرف/أرقام على الأقل',
+    });
+    return;
+  }
+
+  adminPortalAuth = {
+    passwordHash: hashCourierPassword(newPassword.trim()),
+    updatedAt: new Date().toISOString(),
+  };
+  saveStoreToDisk();
+
+  const currentToken = (req as any).adminSession?.token;
+  for (const token of adminPortalSessions.keys()) {
+    if (token !== currentToken) {
+      adminPortalSessions.delete(token);
+    }
+  }
+
+  res.json({
+    success: true,
+    message: 'تم تحديث كلمة مرور لوحة الإدارة بنجاح',
+  });
+});
+
 // 1. System Settings
 app.get('/api/settings', (req: Request, res: Response) => {
   res.json({ success: true, settings });
@@ -1999,9 +2225,15 @@ function ingestLiveOrders(liveOrders: any[], sourceName: string = 'Locat'): { co
 
 // POST /api/locat/sync: The ingestion endpoint called by the Locat Automation Script
 app.post('/api/locat/sync', (req: Request, res: Response) => {
-  const { liveOrders, secretKey } = req.body;
+  const { liveOrders, secretKey } = req.body || {};
+  const headerKey = typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'].trim() : '';
+  const bodyKey = typeof secretKey === 'string' ? secretKey.trim() : '';
+  const hasValidAdmin = Boolean(getValidAdminSession(req));
+  const hasValidApiKey = Boolean(
+    settings.locatApiKey && (bodyKey === settings.locatApiKey || headerKey === settings.locatApiKey)
+  );
 
-  if (settings.locatApiKey && secretKey && secretKey !== settings.locatApiKey) {
+  if (!hasValidAdmin && !hasValidApiKey) {
     res.status(401).json({ success: false, message: 'مفتاح المزامنة غير صالح' });
     return;
   }
@@ -2192,12 +2424,6 @@ app.get('/api/health', (req: Request, res: Response) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     riyadhTime: getRiyadhTimeString(),
-    whatsappStatus: whatsappState.status,
-    whatsappLoggedIn: whatsappState.isLoggedIn,
-    ordersCount: orders.length,
-    couriersCount: couriers.length,
-    persistentDir: PERSISTENT_DIR,
-    hasSavedSession: fs.existsSync(path.join(AUTH_DIR, 'creds.json')),
   });
 });
 
@@ -3991,6 +4217,58 @@ async function startServer() {
 
   // Start 24/7 automated Puppeteer background scraper if enabled
   setupPuppeteer247Runner();
+
+  // Isolated Web App Manifests (Courier Portal can NEVER install Admin Dashboard)
+  app.get('/courier-manifest.webmanifest', (_req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      id: '/courier',
+      name: 'بوابة المندوب لمتابعة الطلبات',
+      short_name: 'بوابة المندوب',
+      description: 'بوابة المندوب لاستعراض الطلبات والإحصائيات الشهرية',
+      theme_color: '#047857',
+      background_color: '#f8fafc',
+      display: 'standalone',
+      start_url: '/courier',
+      scope: '/courier',
+      dir: 'rtl',
+      lang: 'ar',
+      icons: [
+        { src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+        { src: '/pwa-512x512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+        { src: '/pwa-maskable-512x512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+      ],
+    });
+  });
+
+  app.get('/admin-manifest.webmanifest', (_req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      id: '/',
+      name: 'نظام أتمتة ومتابعة لوكيت | Locat Monitor',
+      short_name: 'متابع لوكيت',
+      description: 'لوحة تحكم ونظام أتمتة متكامل لمتابعة طلبات لوكيت وإرسال تنبيهات الواتساب التلقائية.',
+      theme_color: '#059669',
+      background_color: '#f8fafc',
+      display: 'standalone',
+      start_url: '/',
+      scope: '/',
+      dir: 'rtl',
+      lang: 'ar',
+      icons: [
+        { src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+        { src: '/pwa-512x512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+        { src: '/pwa-maskable-512x512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+      ],
+    });
+  });
+
+  // Block legacy global manifest path so cached/stale links cannot install Admin from Courier Portal
+  app.get('/manifest.webmanifest', (_req: Request, res: Response) => {
+    res.status(404).end();
+  });
 
   const httpServer = http.createServer(app);
 

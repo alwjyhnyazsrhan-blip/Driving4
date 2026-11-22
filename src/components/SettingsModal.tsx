@@ -73,6 +73,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [isTestingCloudLogin, setIsTestingCloudLogin] = useState(false);
   const [isSyncingNow, setIsSyncingNow] = useState(false);
   const [cloudFeedback, setCloudFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [newAdminPassword, setNewAdminPassword] = useState('');
+  const [adminPasswordSaving, setAdminPasswordSaving] = useState(false);
+  const [adminPasswordFeedback, setAdminPasswordFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
   // Robustly sync state with latest settings ONLY when modal opens (prevents background polling from wiping out user input)
   useEffect(() => {
@@ -966,6 +969,72 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   className="w-4 h-4 text-emerald-600 rounded focus:ring-emerald-500"
                 />
               </div>
+            </div>
+          </div>
+
+          {/* Section 6: Dedicated Admin Dashboard Password */}
+          <div className="space-y-3 bg-slate-50 p-4 rounded-xl border border-slate-200">
+            <h3 className="font-bold text-slate-900 text-sm flex items-center gap-2">
+              <Key className="w-4 h-4 text-emerald-600" />
+              كلمة مرور قفل لوحة الإدارة
+            </h3>
+            <p className="text-[11px] text-slate-600">
+              عيّن كلمة مرور مخصصة لقفل لوحة الإدارة بحيث لا يتمكن أي مندوب من الدخول إليها حتى لو وصل للرابط.
+            </p>
+            {adminPasswordFeedback && (
+              <div
+                className={`p-2.5 rounded-lg text-xs font-semibold ${
+                  adminPasswordFeedback.type === 'success'
+                    ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                    : 'bg-rose-50 text-rose-800 border border-rose-200'
+                }`}
+              >
+                {adminPasswordFeedback.message}
+              </div>
+            )}
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input
+                type="password"
+                dir="ltr"
+                value={newAdminPassword}
+                onChange={(e) => setNewAdminPassword(e.target.value)}
+                placeholder="أدخل كلمة مرور جديدة (6 أحرف/أرقام فأكثر)"
+                className="flex-1 px-3 py-2 rounded-lg border border-slate-300 bg-white text-xs text-left focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              />
+              <button
+                type="button"
+                disabled={adminPasswordSaving}
+                onClick={async () => {
+                  const trimmed = newAdminPassword.trim();
+                  if (trimmed.length < 6) {
+                    setAdminPasswordFeedback({ type: 'error', message: 'كلمة المرور يجب أن تكون 6 أحرف/أرقام على الأقل' });
+                    return;
+                  }
+                  setAdminPasswordSaving(true);
+                  setAdminPasswordFeedback(null);
+                  try {
+                    const res = await fetch('/api/admin-auth/change-password', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ newPassword: trimmed }),
+                    });
+                    const data = await res.json();
+                    if (res.ok && data?.success) {
+                      setNewAdminPassword('');
+                      setAdminPasswordFeedback({ type: 'success', message: data.message || 'تم تحديث كلمة مرور الإدارة بنجاح' });
+                    } else {
+                      setAdminPasswordFeedback({ type: 'error', message: data?.message || 'تعذر حفظ كلمة المرور' });
+                    }
+                  } catch {
+                    setAdminPasswordFeedback({ type: 'error', message: 'تعذر الاتصال بالخادم' });
+                  } finally {
+                    setAdminPasswordSaving(false);
+                  }
+                }}
+                className="px-4 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 disabled:opacity-60 text-white text-xs font-bold transition cursor-pointer shrink-0"
+              >
+                {adminPasswordSaving ? 'جاري الحفظ...' : 'تعيين كلمة المرور'}
+              </button>
             </div>
           </div>
 

@@ -13,7 +13,13 @@ import { QuickWhatsAppModal } from './components/QuickWhatsAppModal';
 import { GuideWalkthroughModal } from './components/GuideWalkthroughModal';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { CourierPortalView } from './components/CourierPortalView';
-import { getEngineConfig, subscribeEngineConfig } from './services/apiBridge';
+import { AdminLoginView } from './components/AdminLoginView';
+import {
+  getEngineConfig,
+  subscribeEngineConfig,
+  setAdminAuthToken,
+  subscribeAdminUnauthorized,
+} from './services/apiBridge';
 import { Order, Courier, SystemSettings, AlertLog, WhatsAppConnectionState, CloudSyncState } from './types';
 import { Bell, CheckCircle2, AlertTriangle, X } from 'lucide-react';
 
@@ -34,6 +40,7 @@ export default function App() {
   const [isCourierPortalMode, setIsCourierPortalMode] = useState<boolean>(initialPortal.isPortal);
   const [portalInitialPhone, setPortalInitialPhone] = useState<string>(initialPortal.phone);
   const [openedPortalFromAdmin, setOpenedPortalFromAdmin] = useState<boolean>(false);
+  const [adminToken, setAdminToken] = useState<string | null>(null);
   const [currentTab, setCurrentTab] = useState<'orders' | 'couriers' | 'alerts' | 'report' | 'automation'>('orders');
   
   // Data states (clean initial state, filled only with real data from backend/Locat)
@@ -163,7 +170,51 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (isCourierPortalMode) return;
+    setAdminAuthToken(adminToken);
+  }, [adminToken]);
+
+  useEffect(() => {
+    return subscribeAdminUnauthorized(() => {
+      setAdminAuthToken(null);
+      setAdminToken(null);
+    });
+  }, []);
+
+  // Only attach Admin PWA manifest when an Admin is explicitly authenticated (never for couriers or unauthenticated visitors)
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    const existingAdminLink = document.querySelector('link[data-locat-manifest="admin"]');
+    if (!isCourierPortalMode && adminToken) {
+      if (!existingAdminLink) {
+        const link = document.createElement('link');
+        link.rel = 'manifest';
+        link.href = '/admin-manifest.webmanifest';
+        link.setAttribute('data-locat-manifest', 'admin');
+        document.head.appendChild(link);
+      }
+    } else if (existingAdminLink) {
+      existingAdminLink.remove();
+    }
+  }, [isCourierPortalMode, adminToken]);
+
+  const handleAdminAuthenticated = useCallback((token: string) => {
+    setAdminAuthToken(token);
+    setAdminToken(token);
+  }, []);
+
+  const handleLogoutAdmin = useCallback(async () => {
+    try {
+      await fetch('/api/admin-auth/logout', { method: 'POST' });
+    } catch {}
+    setAdminAuthToken(null);
+    setAdminToken(null);
+    setOrders([]);
+    setCouriers([]);
+    setAlerts([]);
+  }, []);
+
+  useEffect(() => {
+    if (isCourierPortalMode || !adminToken) return;
 
     // Restore any custom courier phones previously configured from browser local storage
     try {
@@ -203,10 +254,10 @@ export default function App() {
       fetchData(true);
     }, 20000);
     return () => clearInterval(interval);
-  }, [fetchData, isCourierPortalMode]);
+  }, [fetchData, isCourierPortalMode, adminToken]);
 
   useEffect(() => {
-    if (isCourierPortalMode) return;
+    if (isCourierPortalMode || !adminToken) return;
     let prevBackend = getEngineConfig().activeBackend;
     const unsubscribe = subscribeEngineConfig((cfg) => {
       if (cfg.activeBackend !== prevBackend) {
@@ -217,16 +268,16 @@ export default function App() {
     return () => {
       unsubscribe();
     };
-  }, [fetchData, isCourierPortalMode]);
+  }, [fetchData, isCourierPortalMode, adminToken]);
 
   // Quick follow-up poll until WhatsApp QR code is generated on startup
   useEffect(() => {
-    if (isCourierPortalMode || whatsappState?.isLoggedIn || whatsappState?.qrDataUrl) return;
+    if (isCourierPortalMode || !adminToken || whatsappState?.isLoggedIn || whatsappState?.qrDataUrl) return;
     const qrTimer = setInterval(() => {
       fetchData(true);
     }, 3500);
     return () => clearInterval(qrTimer);
-  }, [whatsappState?.isLoggedIn, whatsappState?.qrDataUrl, fetchData, isCourierPortalMode]);
+  }, [whatsappState?.isLoggedIn, whatsappState?.qrDataUrl, fetchData, isCourierPortalMode, adminToken]);
 
   // Advance time simulation (+5 / +15 mins)
   const handleAdvanceTime = async (minutes: number) => {
@@ -492,7 +543,7 @@ export default function App() {
       <CourierPortalView
         initialPhone={portalInitialPhone}
         onExitPortal={
-          openedPortalFromAdmin
+          openedPortalFromAdmin && adminToken
             ? () => {
                 setIsCourierPortalMode(false);
                 setOpenedPortalFromAdmin(false);
@@ -501,6 +552,10 @@ export default function App() {
         }
       />
     );
+  }
+
+  if (!adminToken) {
+    return <AdminLoginView onAuthenticated={handleAdminAuthenticated} />;
   }
 
   return (
@@ -546,6 +601,7 @@ export default function App() {
         whatsappState={whatsappState}
         cloudSyncState={cloudSyncState}
         onOpenGuide={() => setIsGuideOpen(true)}
+        onLogoutAdmin={handleLogoutAdmin}
       />
 
       {/* Main Content Area */}

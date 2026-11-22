@@ -14,7 +14,8 @@ import {
   Code,
   Radio,
   QrCode,
-  Play
+  Play,
+  LogOut
 } from 'lucide-react';
 import { SystemSettings, Order, WhatsAppConnectionState, CloudSyncState } from '../types';
 import { PWAInstallButton } from './PWAInstallButton';
@@ -35,6 +36,7 @@ interface HeaderProps {
   whatsappState?: WhatsAppConnectionState | null;
   cloudSyncState?: CloudSyncState | null;
   onOpenGuide?: () => void;
+  onLogoutAdmin?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -53,6 +55,7 @@ export const Header: React.FC<HeaderProps> = ({
   whatsappState,
   cloudSyncState,
   onOpenGuide,
+  onLogoutAdmin,
 }) => {
   const delayedOrdersCount = orders.filter((o) => o.isDelayed).length;
 
@@ -219,6 +222,19 @@ export const Header: React.FC<HeaderProps> = ({
             >
               <Sliders className="w-4 h-4" />
             </button>
+
+            {/* Lock / Logout Admin */}
+            {onLogoutAdmin && (
+              <button
+                type="button"
+                onClick={onLogoutAdmin}
+                className="inline-flex items-center gap-1 px-2.5 py-2 text-rose-700 hover:text-rose-900 bg-rose-50 hover:bg-rose-100 rounded-lg border border-rose-200 text-xs font-bold transition cursor-pointer"
+                title="قفل لوحة الإدارة وتسجيل الخروج"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>قفل</span>
+              </button>
+            )}
           </div>
         </div>
 

@@ -11,10 +11,33 @@ import {
 
 type Listener = (cfg: EngineRuntimeConfig) => void;
 const listeners = new Set<Listener>();
+const adminUnauthorizedListeners = new Set<() => void>();
 
 let currentConfig: EngineRuntimeConfig = loadEngineConfig();
 let bridgeInstalled = false;
 let nativeFetchRef: typeof window.fetch | null = null;
+let adminAuthToken: string | null = null;
+
+export function setAdminAuthToken(token: string | null) {
+  adminAuthToken = token && token.trim() ? token.trim() : null;
+}
+
+export function getAdminAuthToken(): string | null {
+  return adminAuthToken;
+}
+
+export function subscribeAdminUnauthorized(cb: () => void): () => void {
+  adminUnauthorizedListeners.add(cb);
+  return () => adminUnauthorizedListeners.delete(cb);
+}
+
+function notifyAdminUnauthorized() {
+  adminUnauthorizedListeners.forEach((cb) => {
+    try {
+      cb();
+    } catch {}
+  });
+}
 
 function notifyListeners() {
   listeners.forEach((cb) => {
@@ -156,8 +179,31 @@ export function installApiBridge() {
       } catch {}
     }
 
+    // Attach in-memory Admin Bearer token on protected admin API calls
+    const isCourierApi = pathname.startsWith('/api/courier-portal');
+    const isPublicAuthApi =
+      pathname === '/api/health' ||
+      pathname === '/api/admin-auth/status' ||
+      pathname === '/api/admin-auth/login' ||
+      pathname === '/api/admin-auth/setup';
+
+    let finalInit: RequestInit | undefined = init;
+    if (!isCourierApi && !isPublicAuthApi && adminAuthToken) {
+      const headers = new Headers(init?.headers || (input instanceof Request ? input.headers : undefined));
+      if (!headers.has('Authorization')) {
+        headers.set('Authorization', `Bearer ${adminAuthToken}`);
+      }
+      finalInit = { ...init, headers };
+    }
+
     // Mode 1: Pure Standalone Browser Mode (Zero hosting / zero backend server calls)
     if (currentConfig.mode === 'standalone') {
+      if (!isCourierApi && !isPublicAuthApi && !adminAuthToken) {
+        return new Response(JSON.stringify({ success: false, code: 'ADMIN_AUTH_REQUIRED', message: 'يرجى تسجيل الدخول للإدارة أولاً' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
       if (currentConfig.activeBackend !== 'standalone') {
         currentConfig = saveEngineConfig({ activeBackend: 'standalone' });
         notifyListeners();
@@ -189,7 +235,7 @@ export function installApiBridge() {
 
     try {
       const response = await originalFetch(targetUrl, {
-        ...init,
+        ...finalInit,
         signal: init?.signal || controller.signal,
       });
       clearTimeout(timeoutId);
@@ -207,14 +253,20 @@ export function installApiBridge() {
         throw new Error(`Hosting unavailable (${response.status})`);
       }
 
+      if (response.status === 401 && !isCourierApi && !isPublicAuthApi) {
+        adminAuthToken = null;
+        notifyAdminUnauthorized();
+        return response;
+      }
+
       const expectedBackend = currentConfig.mode === 'local_server' ? 'local_server' : 'server';
       if (currentConfig.activeBackend !== expectedBackend) {
         currentConfig = saveEngineConfig({ activeBackend: expectedBackend, lastFallbackReason: undefined });
         notifyListeners();
       }
 
-      // Mirror GET responses into local IndexedDB silently
-      if (method === 'GET' && contentType.includes('application/json')) {
+      // Mirror GET responses into local IndexedDB silently only when authenticated
+      if (method === 'GET' && response.ok && contentType.includes('application/json') && (adminAuthToken || isCourierApi)) {
         response
           .clone()
           .json()
@@ -225,6 +277,13 @@ export function installApiBridge() {
       return response;
     } catch (err: any) {
       clearTimeout(timeoutId);
+      // Never leak admin localEngine fallback to unauthenticated visitors
+      if (!isCourierApi && !isPublicAuthApi && !adminAuthToken) {
+        return new Response(JSON.stringify({ success: false, code: 'ADMIN_AUTH_REQUIRED', message: 'تعذر التحقق من جلسة الإدارة' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
       if (currentConfig.activeBackend !== 'standalone') {
         currentConfig = saveEngineConfig({
           activeBackend: 'standalone',

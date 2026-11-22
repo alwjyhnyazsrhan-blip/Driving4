@@ -107,11 +107,11 @@ export const CouriersView: React.FC<CouriersViewProps> = ({
   const [passwordError, setPasswordError] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  const portalBaseUrl = typeof window !== 'undefined' ? `${window.location.origin}/?portal=courier` : '/?portal=courier';
+  const portalBaseUrl = typeof window !== 'undefined' ? `${window.location.origin}/courier` : '/courier';
 
   const handleCopyPortalLink = async (key: string, phone?: string) => {
     const url = phone
-      ? `${portalBaseUrl}&phone=${encodeURIComponent(phone)}`
+      ? `${portalBaseUrl}?phone=${encodeURIComponent(phone)}`
       : portalBaseUrl;
     try {
       await navigator.clipboard.writeText(url);
